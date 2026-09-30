@@ -40,10 +40,8 @@ from sregym.profile import is_svelte
 from sregym.service.apps.app_registry import AppRegistry
 from sregym.service.cluster_egress import ClusterEgressBoundary
 from sregym.service.cluster_state import ClusterStateManager
-from sregym.service.dm_flakey_manager import DmFlakeyManager
 from sregym.service.internet_policy import InternetPolicy
 from sregym.service.k8s_proxy import KubernetesAPIProxy
-from sregym.service.khaos import KhaosController
 from sregym.service.kubectl import KubeCtl
 from sregym.service.mcp_server import MCPServer
 from sregym.service.rollout import deployment_rollout_complete
@@ -94,8 +92,6 @@ class Conductor:
         self.apps = AppRegistry()
         self.agent_name = None
 
-        self.khaos = KhaosController(self.kubectl)
-        self.dm_flakey_manager = DmFlakeyManager(self.kubectl)
         self.cluster_state = ClusterStateManager(self.kubectl)
         self.cluster_egress = ClusterEgressBoundary(self.kubectl)
         self._baseline_captured = False
@@ -649,7 +645,7 @@ class Conductor:
         2) Initialize Act registry and execute initial GymActs and first AgentAct precondition
 
         Returns:
-            StartProblemResult: Result status indicating success or skip reason
+            StartProblemResult.SUCCESS once the problem is running; failures raise.
         """
         if self.problem_id is None:
             raise RuntimeError("Cannot start problem: problem_id is not set")
@@ -694,14 +690,6 @@ class Conductor:
 
         self.logger.info(f"[Session Start] Problem ID: {self.problem_id}")
         self.logger.info(f"[STAGE] Start testing on problem: {self.problem_id}")
-
-        if self.problem.requires_khaos() and self.kubectl.is_emulated_cluster():
-            self.logger.warning(
-                f"Problem '{self.problem_id}' requires Khaos for eBPF-based fault injection, "
-                "but Khaos cannot be deployed on emulated clusters (kind, minikube, k3d, etc.). "
-                "Skipping this problem."
-            )
-            return StartProblemResult.SKIPPED_KHAOS_REQUIRED
 
         with self._phase("fix_kubernetes"):
             self.fix_kubernetes()
@@ -1367,12 +1355,6 @@ class Conductor:
         except Exception as e:
             self.logger.error(f"Failed to recover CoreDNS NXDOMAIN templates: {e}")
 
-        self.logger.info("[FIX] Leftover dm-flakey infrastructure if any")
-        try:
-            self.dm_flakey_manager.teardown_openebs_dm_flakey_infrastructure()
-        except Exception as e:
-            self.logger.warning(f"Could not teardown dm-flakey (Khaos may not be deployed yet): {e}")
-
         self.logger.info("[FIX] NightlyRebalanceOOM kube-system actor leftover if any")
         try:
             from sregym.conductor.problems.nightly_rebalance_oom import NightlyRebalanceOOM
@@ -1438,11 +1420,6 @@ class Conductor:
         self.kubectl.wait_for_ready("kube-system")
         self._wait_for_infrastructure_ready("metrics-server", self._metrics_server_configured)
 
-        # Only deploy Khaos if the problem requires it
-        if problem.requires_khaos():
-            self.logger.info("[DEPLOY] Deploying Khaos DaemonSet...")
-            self.khaos.ensure_deployed()
-
         self.logger.info("[DEPLOY] Setting up OpenEBS…")
         svelte = is_svelte()
         # `openebs` is protected from reconciliation, so it persists across
@@ -1495,7 +1472,7 @@ class Conductor:
         self.logger.info("[DEPLOY] Deploying MCP server…")
         self.mcp_server.deploy()
 
-        self.logger.info("[ENV] Set up necessary components: metrics-server, Khaos, OpenEBS, Prometheus, Jaeger, Loki")
+        self.logger.info("[ENV] Set up necessary components: metrics-server, OpenEBS, Prometheus, Jaeger, Loki")
 
         # train-ticket pods need jaeger at startup; create ExternalName before deploy.
         # Other apps get it after deploy to avoid Helm ownership conflicts.
